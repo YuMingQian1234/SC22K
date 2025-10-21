@@ -60,7 +60,7 @@ try:
     from torch_xla.distributed.fsdp import consolidate_sharded_model_checkpoints
     from torch_xla.distributed.spmd import XlaShardedTensorCheckpointHandler
     from torch_xla.experimental.spmd_fully_sharded_data_parallel import SpmdFullyShardedDataParallel as FSDPv2
-    from torch_xla.amp import syncfree
+    # from torch_xla.amp import syncfree  # Removed unused import
 
     is_torch_xla_available = lambda: True
 except ImportError:
