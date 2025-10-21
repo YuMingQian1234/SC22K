@@ -2,29 +2,126 @@ import os
 import torch
 import torch.nn as nn
 import datetime
+import math
+import sys
+import time
+import shutil
+import numpy as np
 
 from accelerate import Accelerator
-from accelerate.utils import InitProcessGroupKwargs, GradientAccumulationPlugin
-from torch.utils.data import Dataset, Sampler, DataLoader
+from accelerate.utils import InitProcessGroupKwargs, GradientAccumulationPlugin, DistributedType
+from accelerate.data_loader import SeedableRandomSampler
+from torch.utils.data import Dataset, Sampler, DataLoader, RandomSampler
+from torch import distributed as dist
+from packaging import version
 
 from trl.trainer import DPOTrainer
 from trl.trainer.utils import DPODataCollatorWithPadding
 
 from transformers import Trainer
-from transformers.trainer import is_sagemaker_mp_enabled, get_parameter_names, has_length, ALL_LAYERNORM_LAYERS, logger, is_accelerate_available, is_datasets_available, GradientAccumulationPlugin
-from transformers.trainer_utils import seed_worker
+from transformers.trainer import (
+    is_sagemaker_mp_enabled, 
+    get_parameter_names, 
+    has_length, 
+    logger, 
+    is_accelerate_available, 
+    is_datasets_available,
+    TrainerState,
+    TRAINER_STATE_NAME,
+    get_model_param_count,
+    DebugOption,
+    DebugUnderflowOverflow,
+    ParallelMode,
+    deepspeed_init,
+    deepspeed_load_checkpoint,
+    _is_peft_model,
+)
+from transformers.trainer_utils import seed_worker, speed_metrics, HPSearchBackend, TrainOutput
 from transformers.trainer_pt_utils import get_length_grouped_indices as get_length_grouped_indices_hf
-from transformers.trainer_pt_utils import AcceleratorConfig
+from transformers.trainer_pt_utils import AcceleratorConfig, get_dataloader_sampler
+from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
+from transformers.integrations import hp_params
 from typing import List, Optional
 from datetime import timedelta
 
 if is_accelerate_available():
     from accelerate import Accelerator, skip_first_batches, InitProcessGroupKwargs
+    import accelerate
+    accelerate_version = accelerate.__version__
 
 if is_datasets_available():
     import datasets
 
+# Optional TPU/XLA imports
+try:
+    import torch_xla.core.xla_model as xm
+    import torch_xla.debug.metrics as met
+    from torch_xla.distributed.fsdp import consolidate_sharded_model_checkpoints
+    from torch_xla.distributed.spmd import XlaShardedTensorCheckpointHandler
+    from torch_xla.experimental.spmd_fully_sharded_data_parallel import SpmdFullyShardedDataParallel as FSDPv2
+    from torch_xla.amp import syncfree
+    from torch.distributed import _shard
+    is_torch_xla_available = lambda: True
+except ImportError:
+    xm = None
+    met = None
+    is_torch_xla_available = lambda: False
+
+# Optional SageMaker imports
+try:
+    import smdistributed.modelparallel.torch as smp
+except ImportError:
+    smp = None
+
+# Optional function for TPU
+try:
+    from transformers.trainer_pt_utils import tpu_spmd_dataloader
+except ImportError:
+    tpu_spmd_dataloader = None
+
 from llava.utils import rank0_print
+
+
+def plot_graphs_based_on_log_history(log_history, output_dir, metrics):
+    """
+    Plot graphs based on log history. This is a stub function.
+    
+    Args:
+        log_history: Training log history
+        output_dir: Output directory for plots
+        metrics: List of metrics to plot
+    """
+    try:
+        import matplotlib.pyplot as plt
+        
+        if not log_history:
+            return
+            
+        os.makedirs(output_dir, exist_ok=True)
+        
+        for metric in metrics:
+            values = []
+            steps = []
+            for log in log_history:
+                if metric in log:
+                    values.append(log[metric])
+                    steps.append(log.get('step', len(steps)))
+            
+            if values:
+                plt.figure(figsize=(10, 6))
+                plt.plot(steps, values)
+                plt.xlabel('Step')
+                plt.ylabel(metric)
+                plt.title(f'{metric} over training')
+                plt.savefig(os.path.join(output_dir, f'{metric}.png'))
+                plt.close()
+                
+    except ImportError:
+        # matplotlib not available, skip plotting
+        pass
+    except Exception as e:
+        # Don't fail training if plotting fails
+        logger.warning(f"Failed to plot graphs: {e}")
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
