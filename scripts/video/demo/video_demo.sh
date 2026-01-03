@@ -10,7 +10,7 @@ CONV_MODE="video_llava"
 FRAMES=30
 POOL_STRIDE=1024
 POOL_MODE="average"
-NEWLINE_POSITION="no token"
+NEWLINE_POSITION="no_token"
 OVERWRITE=True
 VIDEO_PATH="/online1/zhaopl/zhaopl/yumingqian/Sports_Commentary_Datasets/test/100m/Mens_100m_Final_Paris/Second_Level/Videos/"
 
